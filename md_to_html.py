@@ -7,7 +7,7 @@ Behavior:
 - If no ordering file exists:
   - Creates contents.txt listing discovered Markdown filenames.
   - Builds a combined Markdown file with subsection headers per file.
-- Always produces combined.html from the combined Markdown sequence.
+- Always produces index.html from the combined Markdown sequence.
 """
 
 from __future__ import annotations
@@ -266,7 +266,7 @@ def main() -> None:
 
     combined_md_text = build_combined_markdown(ordered_files)
     combined_md_path = base / "combined.md"
-    combined_html_path = base / "combined.html"
+    combined_html_path = base / "index.html"
 
     combined_md_path.write_text(combined_md_text, encoding="utf-8")
     combined_html_path.write_text(to_html(combined_md_text, title="Combined Markdown"), encoding="utf-8")
