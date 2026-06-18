@@ -1,4 +1,3 @@
 CLAUDE.md
 LSTload.md
 IOpBlockBuilder.md
-LSTload-diagram.md
