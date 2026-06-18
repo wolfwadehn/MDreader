@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IOpBlockBuilder</title>
+  <style>
+    body {
+      max-width: 980px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      font-family: Segoe UI, Arial, sans-serif;
+      line-height: 1.55;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 0.75rem;
+      overflow-x: auto;
+    }
+    code {
+      background: #f4f4f4;
+      padding: 0.1rem 0.25rem;
+      border-radius: 3px;
+    }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; }
+  </style>
+</head>
+<body>
+<h1>IOpBlockBuilder</h1>
+<p><code>IOpBlockBuilder</code> is the narrow writing interface between the NC program interpreter (<code>NcProgramContext</code>) and the geometry tree that represents one NC program block. Every motion command the interpreter encounters is funnelled through exactly one <code>IOpBlockBuilder</code> method call. When the interpreter finishes a program, calling <code>Completed()</code> seals the block and hands it to the tree.</p>
+<p>Both the interface and the concrete implementation live in <code>LSTParser/</code>.</p>
+<hr />
+<h2>Position in the call chain</h2>
+<pre><code>NcConfig.InitOpTree(IOpTreeBuilder)
+  └─ NcContext.BuildOpTree(IOpTreeBuilder)
+       └─ NcProgramContext(…, IOpTreeBuilder)
+            │  asks the tree builder for a block builder:
+            │  mOpBlockBuilder = treeBuilder.CreateOpBlockBuilder(programName, isMain)
+            │
+            ├─ line by line: calls mOpBlockBuilder.AddLineTo / AddArcTo / …
+            │
+            └─ at end: mOpBlockBuilder.Completed(totalLines)
+                         └─ produces HeadOpBlock, stored in OpTreeBuilder
+</code></pre>
+<p>Each NC program (main + every subroutine) gets its own <code>IOpBlockBuilder</code> instance.</p>
+<hr />
+<h2>The companion: <code>IOpTreeBuilder</code></h2>
+<pre><code class="language-csharp">// LSTParser/NcProgram.cs
+public interface IOpTreeBuilder {
+    IOpBlockBuilder CreateOpBlockBuilder(string blockName, bool isMainBlock);
+}
+</code></pre>
+<p><code>IOpTreeBuilder</code> is the factory. <code>NcProgramContext</code> holds a reference to it and uses <code>CreateOpBlockBuilder</code> to obtain a fresh builder for each program it executes. The concrete implementation is <code>OpTreeBuilder</code> (<code>Job2.cs</code>), which accumulates the finished <code>HeadOpBlock</code> objects and exposes the main block as <code>ReconstructedMainBlock</code>.</p>
+<hr />
+<h2>Interface declaration</h2>
+<pre><code class="language-csharp">// LSTParser/NcProgram.cs  (line 901)
+public interface IOpBlockBuilder {
+    void AddLineTo     (int lineNumber, double toX, double toY, OpInfoBits infoBits);
+    void AddArcTo      (int lineNumber, double toX, double toY,
+                        double centerX, double centerY, OpInfoBits infoBits);
+    void AddPunchLineTo(int lineNumber, double toX, double toY,
+                        string punchId, double punchAngle, int punchCount, OpInfoBits infoBits);
+    void AddPunchArcTo (int lineNumber, double toX, double toY,
+                        double centerX, double centerY,
+                        string punchId, double punchAngle, int punchCount, OpInfoBits infoBits);
+    void AddOpBlockRef (int lineNumber, string blockName,
+                        double atX, double atY, double rotation,
+                        bool beginsPart, List&lt;string&gt; lbls);
+    void Completed          (int totalLines);
+    void SetHeadActiveLine  (int lineNumber);
+    void SetHeadInactiveLine(int lineNumber);
+    void SetPartEntryLine   (int lineNumber);
+}
+</code></pre>
+<hr />
+<h2>Methods</h2>
+<h3><code>AddLineTo</code></h3>
+<pre><code class="language-csharp">void AddLineTo(int lineNumber, double toX, double toY, OpInfoBits infoBits)
+</code></pre>
+<p>Records a linear head movement. Called whenever a motion line has at least one of X or Y but the G-code is <strong>not</strong> G02/G03, or the G-code is G02/G03 but has no I/J (treated as linear). Also called for G00 rapid moves (with <code>LaserOn = false</code>).</p>
+<p><code>toX</code>, <code>toY</code> are world coordinates in mm, already transformed by the active <code>NcCoordXfm</code> before this method is called.</p>
+<p><strong>Produces:</strong> <code>HeadOpUnit.CreateLinearToOp(pt, isLaserOn, isBeamSuppressionOn, gotEntryLaserHint, lineNumber, zBase)</code></p>
+<ul>
+<li><code>IsMoveOp = true</code> when <code>LaserOn</code> bit is absent — a non-cutting rapid move.</li>
+<li><code>IsBeamOff = true</code> when <code>G823</code> bit is set (<code>LaserOn</code> must also be set) — beam suppression during a cut (fly-line, micro-joint traverse).</li>
+</ul>
+<hr />
+<h3><code>AddArcTo</code></h3>
+<pre><code class="language-csharp">void AddArcTo(int lineNumber, double toX, double toY,
+              double centerX, double centerY, OpInfoBits infoBits)
+</code></pre>
+<p>Records a circular arc movement. Called when G02 or G03 is present and I and/or J are present on the same line.</p>
+<p><code>centerX</code>, <code>centerY</code> are world-coordinate arc centre points (not the raw I/J increments — the interpreter converts them: <code>center = lastHeadPos + xfm.TransformVectorXY(I, J)</code> before calling).</p>
+<p>The <code>Ccw</code> bit distinguishes G03 (CCW) from G02 (CW).<br />
+The <code>Circle</code> bit is set when there is no X/Y endpoint on the line (classic full-circle syntax <code>G03 I3.326</code>) or when the X/Y displacement evaluates to zero in G91 mode (<code>G03 X0 Y0</code>).</p>
+<p><strong>Produces:</strong> <code>HeadOpUnit.CreateArcToOp(pt, center, isCcw, isCircle, isLaserOn, isBeamSuppressionOn, gotEntryLaserHint, lineNumber, zBase)</code></p>
+<hr />
+<h3><code>AddPunchLineTo</code></h3>
+<pre><code class="language-csharp">void AddPunchLineTo(int lineNumber, double toX, double toY,
+                    string punchId, double punchAngle, int punchCount, OpInfoBits infoBits)
+</code></pre>
+<p>Records a linear punch hit sequence. Called instead of <code>AddLineTo</code> when <code>isPunchOn</code> or <code>isNibbleOn</code> is true at the time a motion line is encountered.</p>
+<p><code>punchId</code> is the tool identifier last set by <code>TC_TOOL_LOAD</code>. <code>punchAngle</code> is always <code>0</code> (not currently extracted from the NC line). <code>punchCount</code> is always <code>1</code> per call.</p>
+<p>The <code>RotatePunch</code> bit on <code>infoBits</code> signals that the tool should rotate to follow the travel direction.</p>
+<p><strong>Produces:</strong> <code>PunchOp.CreateLineHitOp(toPt, punchId, punchAngle, punchCount, rotatePunch, partBegins, lineNumber, zBase)</code></p>
+<hr />
+<h3><code>AddPunchArcTo</code></h3>
+<pre><code class="language-csharp">void AddPunchArcTo(int lineNumber, double toX, double toY,
+                   double centerX, double centerY,
+                   string punchId, double punchAngle, int punchCount, OpInfoBits infoBits)
+</code></pre>
+<p>Records a circular arc punch hit sequence. Called instead of <code>AddArcTo</code> when punch/nibble is active.</p>
+<p>Same arc semantics as <code>AddArcTo</code> for the geometry. Same punch semantics as <code>AddPunchLineTo</code> for the tool fields.</p>
+<p><strong>Produces:</strong> <code>PunchOp.CreateArcHitOp(toPt, center, isCcw, isCircle, punchId, punchAngle, punchCount, rotatePunch, partBegins, lineNumber, zBase)</code></p>
+<hr />
+<h3><code>AddOpBlockRef</code></h3>
+<pre><code class="language-csharp">void AddOpBlockRef(int lineNumber, string blockName,
+                   double atX, double atY, double rotation,
+                   bool beginsPart, List&lt;string&gt; lbls)
+</code></pre>
+<p>Records a subroutine call. Called after <code>NcContext.BuildSubprogram()</code> has already parsed and completed the referenced subroutine, so the corresponding <code>HeadOpBlock</code> already exists in <code>OpTreeBuilder.mSubBlocks</code>.</p>
+<p><code>atX</code>, <code>atY</code> is the head position at the moment of the call (in the caller's frame). <code>rotation</code> is <code>xfm.FrameRotation</code> at the call site. <code>lbls</code> is the list of <code>TC_LABEL</code> strings accumulated since the last call or part entry.</p>
+<p>The concrete implementation skips the call silently if the referenced block has no operations (empty subroutine).</p>
+<p>Advancing the <code>mZBase</code> counter by <code>block.ColorZLength</code> and <code>mLineBase</code> by <code>block.LinesDeepcount - 1</code> ensures that subsequent ops in the calling block receive globally-unique Z-colour indices and absolute line numbers.</p>
+<p><strong>Produces:</strong> <code>new HeadOpBlockRef(block, new Point(atX, atY), rotation, lineNumber, mZBase, beginsPart, lbls)</code></p>
+<hr />
+<h3><code>Completed</code></h3>
+<pre><code class="language-csharp">void Completed(int totalLines)
+</code></pre>
+<p>Seals the block. Called exactly once per <code>NcProgramContext.Execute()</code> invocation, at the very end, after all lines have been processed.</p>
+<p><code>totalLines</code> is the total physical line count of the program as reported by <code>TextLineItr.ItemCount</code>.</p>
+<p>The concrete implementation:
+1. Constructs <code>HeadOpBlock(blockName, mOps, totalLines, partEntryLines, headOnLines, headOffLines)</code> and hands it to <code>OpTreeBuilder.AddOpBlock(block, isMain)</code>.
+2. If the block is the main program and at least one part-entry line was recorded, appends one final sentinel entry at <code>totalLines</code> — this closes the last implicit part range so <code>GetContainingPartReentryPartLineRange</code> always finds a bounded interval.</p>
+<hr />
+<h3><code>SetHeadActiveLine</code></h3>
+<pre><code class="language-csharp">void SetHeadActiveLine(int lineNumber)
+</code></pre>
+<p>Marks the line number of a laser or punch activation command (<code>TC_LASER_ON</code>, <code>TC_LASER_MACHINING_ON</code>, <code>PUNCH_ON</code>, <code>NIBBLE_ON</code>). Called by the interpreter immediately when one of those literals is recognised.</p>
+<p>Only the <strong>first</strong> <code>SetHeadActiveLine</code> call after the preceding <code>SetHeadInactiveLine</code> is recorded (<code>mGotHeadOnLine</code> guard). This is intentional: <code>TC_LASER_ON</code> can be preceded by several preparatory sub-calls in the LST and the guard ensures only the outermost activation line is captured.</p>
+<p>The stored line number is absolute: <code>mLineBase + lineNumber</code> (block-local line converted to global).</p>
+<p><strong>Populates:</strong> <code>HeadOpBlock.HeadOnLines</code> — used by <code>GetLaserOnLineNumber()</code> to locate the activation point preceding any given absolute line.</p>
+<hr />
+<h3><code>SetHeadInactiveLine</code></h3>
+<pre><code class="language-csharp">void SetHeadInactiveLine(int lineNumber)
+</code></pre>
+<p>Marks the line number of a deactivation command (<code>TC_LASER_OFF</code>, <code>PUNCH_OFF</code>, <code>NIBBLE_OFF</code>). Resets <code>mGotHeadOnLine</code> so the next <code>SetHeadActiveLine</code> is accepted.</p>
+<p><strong>Populates:</strong> <code>HeadOpBlock.HeadOffLines</code> — used by <code>GetLaserOffLineNumber()</code>.</p>
+<hr />
+<h3><code>SetPartEntryLine</code></h3>
+<pre><code class="language-csharp">void SetPartEntryLine(int lineNumber)
+</code></pre>
+<p>Marks the line number of an <code>ENTRY_LASER:</code> or <code>ENTRY_PUNCH:</code> comment. These comments appear in the main program immediately before the first cutting move of each part. Called by the interpreter when the comment is encountered; the interpreter also sets <code>partBegins = true</code> so the next <code>AddLineTo</code>/<code>AddArcTo</code> call carries the <code>BeginsPart</code> flag.</p>
+<p>Only called for the main program (the interpreter skips this in subroutines).</p>
+<p><strong>Populates:</strong> <code>HeadOpBlock.PartEntryLines</code> — used by <code>GetContainingPartReentryPartLineRange()</code> to find the line range belonging to the part currently being cut.</p>
+<hr />
+<h2><code>OpInfoBits</code> — the flag register</h2>
+<pre><code class="language-csharp">// LSTParser/NcProgram.cs  (line 922)
+[Flags]
+public enum OpInfoBits : ushort {
+    Ccw         = 0x001,   // G03 — arc is counter-clockwise
+    Circle      = 0x002,   // Full circle (no endpoint / zero displacement)
+    LaserOn     = 0x004,   // isLaserOn was true when the motion was emitted
+    G823        = 0x008,   // Beam suppression flag (fly-line / micro-joint traverse)
+    BeginsPart  = 0x010,   // partBegins was true (main program only)
+    RotatePunch = 0x100,   // Punch tool rotates to follow arc direction
+}
+</code></pre>
+<p><code>OpInfoBits</code> is assembled by <code>NcProgramContext.Execute()</code> immediately before each builder call, using the current interpreter state:</p>
+<table>
+<thead>
+<tr>
+<th>Bit</th>
+<th>Set when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ccw</code></td>
+<td><code>ncG == 3</code></td>
+</tr>
+<tr>
+<td><code>Circle</code></td>
+<td>No X/Y on line, or G91 X0 Y0</td>
+</tr>
+<tr>
+<td><code>LaserOn</code></td>
+<td><code>isLaserOn == true</code></td>
+</tr>
+<tr>
+<td><code>G823</code></td>
+<td><code>G823</code> appeared on the same NC line</td>
+</tr>
+<tr>
+<td><code>BeginsPart</code></td>
+<td><code>partBegins == true</code> <strong>and</strong> this is the main program</td>
+</tr>
+<tr>
+<td><code>RotatePunch</code></td>
+<td><code>A</code> or <code>B</code> word present (not currently extracted, always 0 in practice)</td>
+</tr>
+</tbody>
+</table>
+<p>Extension method for testing: <code>infoBits.HasBit(OpInfoBits.Ccw)</code> (defined in <code>OpBitsUtil</code>).</p>
+<hr />
+<h2>Concrete implementation: <code>OpBlockBuilder</code></h2>
+<p><code>OpBlockBuilder</code> (<code>LSTParser/Job2.cs</code>) is the only implementation and is not <code>public</code>. It is instantiated exclusively by <code>OpTreeBuilder.CreateOpBlockBuilder</code>.</p>
+<h3>Internal state</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mOps</code></td>
+<td><code>List&lt;HeadOp&gt;</code></td>
+<td>Accumulates ops in program order</td>
+</tr>
+<tr>
+<td><code>mZBase</code></td>
+<td><code>int</code></td>
+<td>Global Z-colour index, incremented with each unit op; advanced by <code>block.ColorZLength</code> on each <code>AddOpBlockRef</code></td>
+</tr>
+<tr>
+<td><code>mLineBase</code></td>
+<td><code>int</code></td>
+<td>Global line-number offset, advanced by <code>block.LinesDeepcount - 1</code> on each <code>AddOpBlockRef</code></td>
+</tr>
+<tr>
+<td><code>mPartEntryLines</code></td>
+<td><code>List&lt;int&gt;</code></td>
+<td>Absolute line numbers from <code>SetPartEntryLine</code></td>
+</tr>
+<tr>
+<td><code>mHeadOnLines</code></td>
+<td><code>List&lt;int&gt;</code></td>
+<td>Absolute line numbers from <code>SetHeadActiveLine</code></td>
+</tr>
+<tr>
+<td><code>mHeadOffLines</code></td>
+<td><code>List&lt;int&gt;</code></td>
+<td>Absolute line numbers from <code>SetHeadInactiveLine</code></td>
+</tr>
+<tr>
+<td><code>mGotHeadOnLine</code></td>
+<td><code>bool</code></td>
+<td>Guards against recording duplicate consecutive ON lines</td>
+</tr>
+</tbody>
+</table>
+<h3>Z-colour index</h3>
+<p>Every <code>HeadOpUnit</code> and <code>HeadOpBlockRef</code> carries a <code>ColorZBase</code> integer that uniquely identifies its position in the cutting sequence across all blocks. When the renderer draws the program with a colour gradient (depth-coded "rainbow" view), it uses this index. <code>mZBase</code> is incremented by 1 for each unit op and by <code>block.ColorZLength</code> for each block reference, ensuring there are no gaps or collisions even when subroutines are called multiple times from different call sites.</p>
+<h3>What <code>Completed()</code> produces</h3>
+<pre><code class="language-csharp">public void Completed(int totalLines) {
+    mTreeBuilder.AddOpBlock(
+        new HeadOpBlock(mBlockName, mOps, totalLines,
+                        mIsMain ? mPartEntryLines : null,
+                        mHeadOnLines, mHeadOffLines),
+        mIsMain);
+    if (mIsMain &amp;&amp; mPartEntryLines.Any())
+        SetPartEntryLine(totalLines); // sentinel for last part range
+}
+</code></pre>
+<p><code>PartEntryLines</code> is only passed to <code>HeadOpBlock</code> for the main program; subroutine blocks receive <code>null</code> because part-boundary tracking is a main-program concept.</p>
+<hr />
+<h2>Summary: one builder call per NC line</h2>
+<table>
+<thead>
+<tr>
+<th>NC line type</th>
+<th>Builder method</th>
+<th>Resulting <code>HeadOp</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>G01 X… Y…</code> (laser on)</td>
+<td><code>AddLineTo</code></td>
+<td><code>HeadOpUnit</code> — <code>IsMoveOp=false</code></td>
+</tr>
+<tr>
+<td><code>G00 X… Y…</code> (rapid)</td>
+<td><code>AddLineTo</code></td>
+<td><code>HeadOpUnit</code> — <code>IsMoveOp=true</code></td>
+</tr>
+<tr>
+<td><code>G01 X… Y…</code> with G823</td>
+<td><code>AddLineTo</code></td>
+<td><code>HeadOpUnit</code> — <code>IsBeamOff=true</code></td>
+</tr>
+<tr>
+<td><code>G02/G03 X… I… J…</code></td>
+<td><code>AddArcTo</code></td>
+<td><code>HeadOpUnit</code> — <code>IsArc=true</code></td>
+</tr>
+<tr>
+<td><code>G03 I…</code> (no X/Y)</td>
+<td><code>AddArcTo</code></td>
+<td><code>HeadOpUnit</code> — <code>IsCircle=true</code></td>
+</tr>
+<tr>
+<td>Any motion while punch active</td>
+<td><code>AddPunchLineTo</code> / <code>AddPunchArcTo</code></td>
+<td><code>PunchOp</code></td>
+</tr>
+<tr>
+<td>Subroutine name literal</td>
+<td><code>AddOpBlockRef</code></td>
+<td><code>HeadOpBlockRef</code></td>
+</tr>
+<tr>
+<td><code>TC_LASER_ON</code></td>
+<td><code>SetHeadActiveLine</code></td>
+<td>— (metadata only)</td>
+</tr>
+<tr>
+<td><code>TC_LASER_OFF</code></td>
+<td><code>SetHeadInactiveLine</code></td>
+<td>— (metadata only)</td>
+</tr>
+<tr>
+<td><code>;ENTRY_LASER:</code> comment</td>
+<td><code>SetPartEntryLine</code></td>
+<td>— (metadata only)</td>
+</tr>
+<tr>
+<td>End of program</td>
+<td><code>Completed(totalLines)</code></td>
+<td>seals → <code>HeadOpBlock</code></td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

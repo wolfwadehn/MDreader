@@ -1,0 +1,655 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LSTload</title>
+  <style>
+    body {
+      max-width: 980px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      font-family: Segoe UI, Arial, sans-serif;
+      line-height: 1.55;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 0.75rem;
+      overflow-x: auto;
+    }
+    code {
+      background: #f4f4f4;
+      padding: 0.1rem 0.25rem;
+      border-radius: 3px;
+    }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; }
+  </style>
+</head>
+<body>
+<h1>LST File Loading Pipeline</h1>
+<p>A <code>.lst</code> file is never executed directly. Loading one triggers a two-stage process: parse the LST into an in-memory operation tree, then transpile that tree to a <code>.din</code> file on disk, which is finally parsed as a normal DIN program. The result is an <code>NCCodeFile</code> (concretely a <code>DINFile</code>) together with a set of <code>LSTPart</code> objects extracted in parallel.</p>
+<hr />
+<h2>Entry Point</h2>
+<pre><code class="language-csharp">// CAMLib/NCCodeFile.cs
+public static NCCodeFile LoadNCCodeFile(string filename, bool iEditmode = false)
+</code></pre>
+<p>When <code>Path.GetExtension(filename)</code> is <code>".lst"</code>, this method calls <code>ProcessLST(filename)</code>, which returns a path to a generated <code>.din</code> file. That path is then loaded with <code>new DINFile(dinPath, iEditmode)</code> and returned.</p>
+<p>The generated DIN files live at:</p>
+<pre><code>{Lib.ProgramsPath}/DINs/{filenameWithoutExtension}.din
+</code></pre>
+<hr />
+<h2>Stage 1 — Structural Parsing: <code>NcConfig.Create()</code></h2>
+<pre><code class="language-csharp">// LSTParser/NcProgram.cs
+public static NcConfig Create(string lstContent)
+</code></pre>
+<p>This is the lowest-level LST parser. It reads the entire file as a string and produces a <code>NcConfig</code> object holding all tables and NC program listings.</p>
+<h3>Line iteration: <code>LstItr</code></h3>
+<p><code>LstItr</code> (<code>LSTParser/Lst.cs</code>) wraps a raw line sequence and handles <strong>line continuations</strong>:
+- A line starting with <code>*</code> (space or tab) is a soft continuation — the <code>*</code> prefix is stripped and the text is appended to the previous line.
+- A line starting with <code>-</code> is a value-split continuation — the opening/closing single-quote boundary of a CSV string value is spliced back together.</p>
+<p><code>LstItr</code> exposes <code>.LineNumber</code> (tracks the first physical line of each logical line) and <code>.ItemCount</code>.</p>
+<h3>Table blocks</h3>
+<p>All lines matching <code>BEGIN_TABLENAME … ENDE_TABLENAME</code> are collected into <code>LstTable</code> objects and stored in <code>NcConfig.mTables</code>. Common table names:</p>
+<table>
+<thead>
+<tr>
+<th>Table name</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PROGRAMM</code></td>
+<td>Program list (name, type HP/UP, part index)</td>
+</tr>
+<tr>
+<td><code>SHEET_TECH</code></td>
+<td>Sheet X/Y/Z dimensions, material ID</td>
+</tr>
+<tr>
+<td><code>SHEET_LOAD_DATA</code></td>
+<td>Suction-cup groups, peel type, double-sheet detector</td>
+</tr>
+<tr>
+<td><code>MACHINE_LOAD_DATA</code></td>
+<td>Machine zero-point offsets</td>
+</tr>
+<tr>
+<td><code>EINRICHTEPLAN_INFO</code></td>
+<td>Program name, machine name, operator, estimate time</td>
+</tr>
+<tr>
+<td><code>PARTS_IN_PROGRAM</code></td>
+<td>Part definitions (ID, bounding box)</td>
+</tr>
+<tr>
+<td><code>PARTS_IN_PROGRAM_POS</code></td>
+<td>Part placements (position, rotation)</td>
+</tr>
+<tr>
+<td><code>WZG_STAMM</code> / <code>PTT</code></td>
+<td>Punch tool definitions</td>
+</tr>
+<tr>
+<td><code>LTT_STAMM</code> / <code>LTT_CALLS</code></td>
+<td>Laser tool/material references</td>
+</tr>
+<tr>
+<td><code>MICROJOINT</code></td>
+<td>Micro-joint widths per tool</td>
+</tr>
+<tr>
+<td><code>FERTIGUNG_AUFTRAG_TMP</code></td>
+<td>Production plan rows (used for multi-job LSTs)</td>
+</tr>
+<tr>
+<td><code>TUBE_TECH</code></td>
+<td>Tube workpiece specifications</td>
+</tr>
+</tbody>
+</table>
+<p><code>LstTable</code> stores column definitions (<code>List&lt;ColumnInfo&gt; mColumns</code>) and raw rows (<code>List&lt;string[]&gt; mRowCells</code>). Data is accessed via:
+- <code>GetS(row, columnId)</code> — string
+- <code>GetF(row, columnId)</code> — <code>double</code>
+- <code>GetMM(row, columnId)</code> — <code>double</code>, auto-converts inches to mm</p>
+<h3>NC program listings</h3>
+<p>Within the <code>PROGRAMM</code> table block, each program is delimited by <code>START_TEXT … STOP_TEXT</code>. Lines between those markers are collected as <code>List&lt;string&gt;</code> and stored in <code>NcConfig.mNcListings</code> (a <code>Dictionary&lt;string, List&lt;string&gt;&gt;</code>). The PROGRAMM table row with type <code>"HP"</code> identifies the main program; rows with type <code>"UP"</code> are subroutines. <code>mMainProgramName</code> holds the name of the HP entry.</p>
+<h3>Sheet dimensions</h3>
+<p><code>NcConfig.SheetX</code>, <code>SheetY</code>, <code>SheetZ</code> are read from <code>SHEET_TECH</code> columns 20, 30, 40.<br />
+<code>NcConfig.ZeroPointX</code>, <code>ZeroPointY</code> come from <code>SHEET_LOAD_DATA</code> or <code>MACHINE_LOAD_DATA</code>.<br />
+If <code>SheetX</code> or <code>SheetY</code> is <code>NaN</code> after parsing, <code>JobUtil2.CreateJob</code> throws <code>FileFormatException("Missing sheet size")</code>.</p>
+<hr />
+<h2>Stage 2 — Operation Tree: <code>NcConfig.InitOpTree()</code> → <code>NcContext.BuildOpTree()</code></h2>
+<pre><code class="language-csharp">// NcProgram.cs
+public void InitOpTree(IOpTreeBuilder treeBuilder, ILogger logger)
+</code></pre>
+<p>This drives the NC program interpreter. An <code>OpTreeBuilder</code> (defined in <code>Job2.cs</code>) is passed in as the <code>IOpTreeBuilder</code>. After this call, <code>treeBuilder.ReconstructedMainBlock</code> holds the complete geometry tree.</p>
+<h3><code>NcContext</code></h3>
+<p><code>NcContext</code> owns the full listing map. Its <code>BuildOpTree()</code>:
+1. Creates a <code>NcProgramContext</code> for the main program.
+2. Calls <code>Execute()</code> on it.
+3. Records whether the main program uses absolute dimensioning (<code>IsMainPrgAbsolute</code>).</p>
+<h3><code>NcProgramContext.Execute()</code></h3>
+<p>This is the core NC interpreter (<code>NcProgram.cs</code>, line 120). It iterates lines via <code>TextLineItr</code>, tokenises each with <code>NcItem.Parse(line)</code>, and maintains the following state:</p>
+<table>
+<thead>
+<tr>
+<th>State variable</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>headPositionX/Y</code></td>
+<td>Current laser head position in world coordinates (mm)</td>
+</tr>
+<tr>
+<td><code>isLaserOn</code></td>
+<td><code>TC_LASER_ON</code> / <code>TC_LASER_MACHINING_ON</code> sets this; <code>TC_LASER_OFF</code> clears it</td>
+</tr>
+<tr>
+<td><code>isPunchOn</code> / <code>isNibbleOn</code></td>
+<td>Punch tool active state</td>
+</tr>
+<tr>
+<td><code>mUseAbsoluteDimension</code></td>
+<td><code>G90</code> = absolute, <code>G91</code> = incremental</td>
+</tr>
+<tr>
+<td><code>mUnitScale</code></td>
+<td>1.0 (metric) or 25.4 (inch, set by <code>G70</code>/<code>G71</code>)</td>
+</tr>
+<tr>
+<td><code>xfm: NcCoordXfm</code></td>
+<td>Active coordinate frame (translation + rotation)</td>
+</tr>
+<tr>
+<td><code>partBegins</code></td>
+<td>Raised on <code>ENTRY_LASER:</code> / <code>ENTRY_PUNCH:</code> comment; cleared after first laser-on move</td>
+</tr>
+</tbody>
+</table>
+<h4>Token types produced by <code>NcItem.Parse()</code></h4>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Examples</th>
+<th>Handling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NcWord</code></td>
+<td><code>X</code>, <code>Y</code>, <code>I</code>, <code>J</code>, <code>G</code>, <code>A</code>, <code>B</code>, <code>Z</code>, <code>F</code>, <code>M</code></td>
+<td>Extracted into <code>ncX</code>, <code>ncY</code>, <code>ncI</code>, <code>ncJ</code>, <code>ncG</code>; unit-scaled; <code>mBits</code> flags set</td>
+</tr>
+<tr>
+<td><code>Comment</code></td>
+<td><code>;ENTRY_LASER:</code></td>
+<td>Sets <code>partBegins = true</code>; calls <code>SetPartEntryLine()</code></td>
+</tr>
+<tr>
+<td><code>Literal</code></td>
+<td><code>TRANS</code>, <code>ATRANS</code>, <code>PUNCH_ON</code>, <code>NIBBLE_ON</code>, subprogram name</td>
+<td>Frame manipulation or subroutine dispatch</td>
+</tr>
+<tr>
+<td><code>NcROT</code> / <code>NcAROT</code></td>
+<td><code>ROT RPL=90</code>, <code>AROT RPL=45</code></td>
+<td>Updates <code>xfm</code> rotation</td>
+</tr>
+<tr>
+<td><code>SubCall</code></td>
+<td><code>TC_LASER_ON(…)</code>, <code>TC_TOOL_LOAD(…)</code>, <code>TC_SHEET_REPOSIT(…)</code></td>
+<td>Sets <code>isLaserOn</code>, <code>PunchId</code>, repositions frame</td>
+</tr>
+</tbody>
+</table>
+<h4>Coordinate transformation</h4>
+<p><code>NcCoordXfm</code> is immutable (<code>LSTParser/NcProgram.cs</code>). Every frame command creates a new instance:</p>
+<ul>
+<li><code>xfm.Translated(dx, dy, isAdditive)</code> — <code>TRANS</code> resets, <code>ATRANS</code> adds</li>
+<li><code>xfm.Rotated(angle, isAdditive)</code> — <code>ROT</code> resets, <code>AROT</code> adds</li>
+<li><code>xfm.Appended(other)</code> — composes two transforms (used when a subroutine modifies the frame)</li>
+</ul>
+<p>Absolute positions are transformed with <code>xfm.TransformPointXY(ref x, ref y)</code> (applies rotation then translation). Relative vectors (arc <code>IJ</code> deltas) use <code>xfm.TransformVectorXY(ref x, ref y)</code> (rotation only, no translation).</p>
+<p>The zero-point offset from <code>SHEET_LOAD_DATA</code> is baked in at the start of the main program:</p>
+<pre><code class="language-csharp">xfm = xfm.Translated(-ncConfig.ZeroPointX, -ncConfig.ZeroPointY, false);
+</code></pre>
+<h4>Motion dispatch</h4>
+<p>After all NC words on a line are collected:</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th><code>IOpBlockBuilder</code> call</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>G02</code>/<code>G03</code> with <code>I</code>/<code>J</code> present</td>
+<td><code>AddArcTo(lineNum, toX, toY, centerX, centerY, bits)</code></td>
+</tr>
+<tr>
+<td><code>G02</code>/<code>G03</code> with no X/Y, or X/Y displacement = 0</td>
+<td>Same, plus <code>OpInfoBits.Circle</code></td>
+</tr>
+<tr>
+<td>Has <code>X</code> or <code>Y</code> (linear)</td>
+<td><code>AddLineTo(lineNum, toX, toY, bits)</code></td>
+</tr>
+<tr>
+<td>Punch/nibble active + arc</td>
+<td><code>AddPunchArcTo(...)</code></td>
+</tr>
+<tr>
+<td>Punch/nibble active + linear</td>
+<td><code>AddPunchLineTo(...)</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>OpInfoBits</code> flags carried per operation:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>LaserOn</code></td>
+<td><code>isLaserOn</code> at time of move</td>
+</tr>
+<tr>
+<td><code>G823</code></td>
+<td><code>G823</code> present on same line (beam suppression / fly-line)</td>
+</tr>
+<tr>
+<td><code>BeginsPart</code></td>
+<td><code>partBegins</code> was set (main program only)</td>
+</tr>
+<tr>
+<td><code>Ccw</code></td>
+<td><code>G03</code></td>
+</tr>
+<tr>
+<td><code>Circle</code></td>
+<td>Full-circle arc condition</td>
+</tr>
+</tbody>
+</table>
+<h4>Subroutine dispatch</h4>
+<p>When a bare <code>Literal</code> token matches a known subprogram name (<code>NcContext.IsSubProgramName()</code>):</p>
+<ol>
+<li><code>NcContext.BuildSubprogram(this, name)</code> is called.</li>
+<li>A new <code>NcProgramContext</code> is constructed inheriting <code>mUseAbsoluteDimension</code>, <code>mUnitScale</code>, and <code>PunchId</code> from the caller.</li>
+<li><code>Execute()</code> runs on the subroutine listing.</li>
+<li>The return value is <code>Tuple&lt;dispX, dispY, dimMode, dimModeReset, xfmOrNull&gt;</code> — the head displacement and any frame changes the subroutine made.</li>
+<li>Back in the caller, <code>mOpBlockBuilder.AddOpBlockRef(lineNum, name, headX, headY, xfm.FrameRotation, partBegins, labels)</code> records a reference to the subroutine's block.</li>
+<li>In incremental mode, the caller's head position is advanced by the subroutine's displacement.</li>
+</ol>
+<p>Each subroutine is executed only once (memoised in <code>mHeadDisplacementMap</code>). The maximum call depth is 8.</p>
+<hr />
+<h2>Stage 3 — <code>OpTreeBuilder</code> and Result Objects</h2>
+<p><code>OpBlockBuilder</code> (<code>Job2.cs</code>) accumulates operations into a list and, on <code>Completed(totalLines)</code>, hands a <code>HeadOpBlock</code> to <code>OpTreeBuilder</code>. The main block is stored in <code>ReconstructedMainBlock</code>; subroutine blocks go into <code>mSubBlocks</code>.</p>
+<h3><code>HeadOpBlock</code></h3>
+<pre><code class="language-csharp">class HeadOpBlock {
+    string Name;                // Program/block name
+    List&lt;HeadOp&gt; HeadOps;      // Operations in program order
+    int TotalLines;             // Total NC lines in block
+    List&lt;int&gt; PartEntryLines;  // Abs line numbers of ENTRY_LASER/ENTRY_PUNCH (main only)
+    List&lt;int&gt; HeadOnLines;     // Abs line numbers of first LASER_ON per cut
+    List&lt;int&gt; HeadOffLines;    // Abs line numbers of LASER_OFF
+    int ColorZLength;          // Depth for Z-color visualisation (= HeadOps.Count)
+}
+</code></pre>
+<p><code>HeadOp</code> is abstract. The three concrete types:</p>
+<h3><code>HeadOpUnit</code> — a single motion segment</h3>
+<pre><code class="language-csharp">class HeadOpUnit : HeadOp {
+    Point ToPt;                  // World-coordinate end point (mm)
+    Point ArcCenter;             // Arc centre (mm), meaningful only when IsArc
+    bool IsMoveOp;               // true = non-cutting rapid (laser off)
+    bool IsArc;                  // false = line, true = arc
+    bool IsCcw;                  // Arc direction
+    bool IsCircle;               // Full circle
+    bool IsBeamOff;              // G823 beam-suppression flag
+    bool IsEntryLaserHinted;     // Was BeginsPart set when this op was emitted
+    int LineNumber;              // Block-local source line number
+    int AbsLineNumber;           // Absolute line number across all blocks
+    int ColorZIndex;             // Sequential index for Z-colour rendering
+}
+</code></pre>
+<h3><code>PunchOp : HeadOpUnit</code> — a punch hit</h3>
+<pre><code class="language-csharp">class PunchOp : HeadOpUnit {
+    string PunchId;    // Punch tool identifier (from TC_TOOL_LOAD)
+    float PunchAngle;  // Rotation at hit time
+    int PunchCount;    // Number of hits
+}
+</code></pre>
+<h3><code>HeadOpBlockRef : HeadOp</code> — a subroutine call</h3>
+<pre><code class="language-csharp">class HeadOpBlockRef : HeadOp {
+    HeadOpBlock Block;      // The referenced subroutine block
+    Point Pos;              // Call-site head position (world coordinates, mm)
+    double Rotation;        // Frame rotation at call site (degrees)
+    NcCoordXfm Xfm;        // Full coordinate transform at call site
+    List&lt;string&gt; Labels;   // TC_LABEL strings collected before this call
+    bool BeginsPart;       // partBegins was true at call site
+    int ColorZLength;      // Delegated from Block.ColorZLength
+}
+</code></pre>
+<hr />
+<h2>Stage 4 — <code>JobUtil2.CreateJob()</code></h2>
+<pre><code class="language-csharp">// LSTParser/Job2.cs
+public static Job CreateJob(
+    string lstContent,
+    out List&lt;Tuple&lt;string, bool, bool, List&lt;string&gt;&gt;&gt; programs,
+    out List&lt;LstTable&gt; tables,
+    out bool isInch,
+    out bool iSheetMeasure,
+    out bool iMainPrgAbsolute)
+</code></pre>
+<p>This is the public assembly point called from <code>ProcessLST</code>. It:</p>
+<ol>
+<li>Calls <code>NcConfig.Create(lstContent)</code>.</li>
+<li>Creates an <code>OpTreeBuilder</code> and calls <code>ncConfig.InitOpTree(treeBuilder, logger)</code>.</li>
+<li>Reads <code>treeBuilder.ReconstructedMainBlock</code>.</li>
+<li>Constructs <code>Sheet(sheetX, sheetY, sheetZ)</code> and <code>Workitem(sheet, headOpBlock)</code>.</li>
+<li>Calls <code>ncConfig.GetNcPrgListings()</code> → populates <code>programs</code> out-param (each entry: <code>(name, isMain, isAbsolute, lines)</code>).</li>
+<li>Adds punch tools: <code>StdPunch</code> if the tool has geometry parameters, <code>CustomPunch</code> otherwise.</li>
+<li>Returns <code>ncConfig.GetTables()</code> as <code>tables</code>, plus <code>isInch</code> and <code>iMainPrgAbsolute</code> flags.</li>
+</ol>
+<h3><code>Job</code></h3>
+<pre><code class="language-csharp">sealed class Job {
+    Workitem Workitem;          // Sheet geometry + op tree
+    double mZeroOffsetX;       // Null-point X offset from SHEET_LOAD_DATA
+    List&lt;IPunch&gt; mPunches;     // Punch tool palette
+}
+</code></pre>
+<h3><code>Workitem</code></h3>
+<pre><code class="language-csharp">class Workitem {
+    Workpiece Workpiece;        // Sheet or Tube with Width, Height, Thickness
+    HeadOpBlock HeadOpBlock;   // Root of the operation tree
+}
+</code></pre>
+<p><code>Sheet : Workpiece</code> (type <code>Types.Sheet</code>) holds the flat-sheet dimensions.<br />
+<code>Tube : Workpiece</code> (type <code>Types.Tube</code>) is used when <code>TUBE_TECH</code> is present.</p>
+<hr />
+<h2>Stage 5 — Part Extraction: <code>LoadParts()</code></h2>
+<p>Running in parallel with DIN generation inside <code>ProcessLST</code>:</p>
+<pre><code class="language-csharp">// CAMLib/NCCodeFile.cs
+static void LoadParts(HeadOpBlock block, string fileName)
+</code></pre>
+<p>This populates the static <code>sParts: List&lt;LSTPart&gt;</code>. For each <code>HeadOpBlockRef</code> in <code>block.HeadOps</code> it creates an <code>LSTPart</code> named after the referenced block and calls <code>ConsumeSubPgm(bref.Block, part)</code> to fill it with geometry.</p>
+<p><code>ConsumeSubPgm</code> walks every <code>HeadOp</code>:
+- <code>HeadOpUnit</code> with <code>IsArc</code> → <code>pline.Add(ptPrev, arcCenter, isCCW)</code> then <code>pline.Add(pt)</code>.
+- <code>HeadOpUnit</code> with <code>IsMoveOp</code> → finalises the current <code>Pline</code> and starts a new one.
+- <code>HeadOpUnit</code> linear → <code>pline.Add(ptPrev)</code> then <code>pline.Add(pt)</code>.
+- Nested <code>HeadOpBlockRef</code> → recursive <code>ConsumeSubPgm</code> into a child <code>LSTPart</code>.</p>
+<p><code>LSTPart</code> (<code>CAMLib/LSTPart.cs</code>):</p>
+<pre><code class="language-csharp">class LSTPart {
+    string Name;
+    List&lt;Pline&gt; mPlines;    // Continuous geometric paths
+    List&lt;string&gt; SubPgms;  // Names of child part blocks
+}
+</code></pre>
+<hr />
+<h2>Stage 6 — DIN Code Generation: <code>ProcessPgm()</code> in <code>ProcessLST()</code></h2>
+<p>After <code>LoadParts</code>, <code>ProcessLST</code> writes the DIN header and then calls <code>ProcessPgm</code> for the main program and each subroutine to produce DIN lines in <code>contents: List&lt;string&gt;</code>.</p>
+<h3>DIN header (from EINRICHTEPLAN_INFO and SHEET_TECH tables)</h3>
+<pre><code>%1(PROGRAM_NAME.DIN)
+(MACHINE: machineName)
+(USER: operatorName)
+MachiningTime = estimateTime
+Sheet_Size_X = x
+Sheet_Size_Y = y
+G90  (or G91)
+M15
+G17 D=SheetRotation
+CheckBoundPrg
+</code></pre>
+<h3>Per-program LST → DIN command mapping</h3>
+<table>
+<thead>
+<tr>
+<th>LST construct</th>
+<th>DIN output</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TC_LASER_ON(params)</code></td>
+<td><code>N{n} M1014</code> + <code>TC_UPDATE_PARAM R[CutParams;CMValue;MJLen;NJLen]</code> + <code>TC_LASER_ON R[params]</code></td>
+<td><code>CMValue</code> encodes G823 (bit 0), G821/MJ (bit 1), G824/NJ (bit 2)</td>
+</tr>
+<tr>
+<td><code>TC_LASER_MACHINING_ON</code></td>
+<td>Same as <code>TC_LASER_ON</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>TC_LASER_OFF</code></td>
+<td><code>N{n} M1015</code></td>
+<td>Laser-off marker</td>
+</tr>
+<tr>
+<td><code>G01/G02/G03 X Y I J</code></td>
+<td>Direct NC copy</td>
+<td>Coordinates already in mm</td>
+</tr>
+<tr>
+<td><code>TC_SHEET_TECH(…)</code></td>
+<td><code>TC_SHEET_THICK(…)</code></td>
+<td>Renamed</td>
+</tr>
+<tr>
+<td><code>TC_SHEET_LOAD</code></td>
+<td>skipped</td>
+<td><code>skipInfo</code> list</td>
+</tr>
+<tr>
+<td><code>;GOTOF ENTRY_LASER</code></td>
+<td>skipped</td>
+<td><code>skipInfo</code> list</td>
+</tr>
+<tr>
+<td><code>ENTRY_LASER:</code></td>
+<td>skipped</td>
+<td><code>skipInfo</code> list</td>
+</tr>
+<tr>
+<td><code>TC_PART_END</code></td>
+<td>skipped</td>
+<td><code>skipInfo</code> list</td>
+</tr>
+<tr>
+<td><code>G823</code> (fly-line)</td>
+<td><code>(G823)</code></td>
+<td>Wrapped in comment</td>
+</tr>
+<tr>
+<td><code>G821</code> (micro-joint)</td>
+<td><code>(G821)</code></td>
+<td>Wrapped in comment</td>
+</tr>
+<tr>
+<td><code>G824</code> (nano-joint)</td>
+<td><code>M1030</code> or <code>M1031</code></td>
+<td>Converted to motion code</td>
+</tr>
+<tr>
+<td><code>ROT RPL=angle</code></td>
+<td><code>G89 C={angle}</code></td>
+<td>Rotation command</td>
+</tr>
+<tr>
+<td><code>TRANS / ATRANS</code></td>
+<td>Applied to output coordinates</td>
+<td></td>
+</tr>
+<tr>
+<td>Subprogram call name</td>
+<td><code>G22 J{blockNumber}</code></td>
+<td>Block number assigned during output</td>
+</tr>
+<tr>
+<td><code>TC_WAIT(…)</code></td>
+<td><code>TC_Wait R[…]</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>MSG(text)</code></td>
+<td><code>G253 text</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>G04 X{t}</code></td>
+<td><code>G04 X{t}</code></td>
+<td>Dwell passthrough</td>
+</tr>
+<tr>
+<td><code>TC_POS_LEVEL</code></td>
+<td><code>TC_POS_LEVEL</code> + following move</td>
+<td><code>arr</code> group — output with context</td>
+</tr>
+<tr>
+<td><code>TC_LASER_OFF</code></td>
+<td>also in <code>arr</code> group</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p><code>scM1014</code> and <code>scDuplicates</code> are matched at the end; a mismatch throws <code>ExceptionType.M1014SyncError</code>.</p>
+<p>The file ends with:</p>
+<pre><code>N2147483647
+CallBoundPrg
+G99
+</code></pre>
+<hr />
+<h2>Stage 7 — DIN Parsing: <code>DINFile</code></h2>
+<p>Once <code>ProcessLST</code> writes the <code>.din</code> file and returns its path, <code>LoadNCCodeFile</code> does:</p>
+<pre><code class="language-csharp">ncCode = new DINFile(filename, iEditmode);
+</code></pre>
+<p><code>DINFile : NCCodeFile</code> (<code>CAMLib/DINFile.cs</code>) parses the DIN format and populates the <code>NCCodeFile</code> properties available to callers:</p>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Populated from</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SheetSize</code></td>
+<td><code>Sheet_Size_X/Y</code> header lines</td>
+</tr>
+<tr>
+<td><code>Contours[]</code></td>
+<td><code>NCContour</code> objects built from G01/G02/G03 sequences</td>
+</tr>
+<tr>
+<td><code>Drawing</code></td>
+<td><code>NCDrawing</code> built from contours</td>
+</tr>
+<tr>
+<td><code>Lines[]</code></td>
+<td>Raw DIN source lines</td>
+</tr>
+<tr>
+<td><code>Name</code></td>
+<td><code>Path.GetFileNameWithoutExtension(lstFileName)</code></td>
+</tr>
+<tr>
+<td><code>FilePath</code></td>
+<td>Path of the generated <code>.din</code> file</td>
+</tr>
+<tr>
+<td><code>UnHandledCodes</code></td>
+<td>Set of LST codes that had no DIN mapping</td>
+</tr>
+</tbody>
+</table>
+<p><code>NCCodeFile.LoadNCCodeFile</code> also calls <code>ncCode.CheckForRemnant()</code> after construction and, if <code>ContainsNJ</code> (nano-joint) is set, re-parses the DIN a second time.</p>
+<hr />
+<h2>Object Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th>Defined in</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NcConfig</code></td>
+<td><code>LSTParser/NcProgram.cs</code></td>
+<td>Raw parse result: tables + NC listings</td>
+</tr>
+<tr>
+<td><code>LstTable</code></td>
+<td><code>LSTParser/Lst.cs</code></td>
+<td>One <code>BEGIN_…ENDE_</code> block with typed cell access</td>
+</tr>
+<tr>
+<td><code>NcCoordXfm</code></td>
+<td><code>LSTParser/NcProgram.cs</code></td>
+<td>Immutable frame transform (translate + rotate)</td>
+</tr>
+<tr>
+<td><code>Job</code></td>
+<td><code>LSTParser/Job.cs</code></td>
+<td>Top-level result: workitem + punch palette + zero offset</td>
+</tr>
+<tr>
+<td><code>Workitem</code></td>
+<td><code>LSTParser/Job.cs</code></td>
+<td>Sheet + root <code>HeadOpBlock</code></td>
+</tr>
+<tr>
+<td><code>Sheet / Tube</code></td>
+<td><code>LSTParser/Job.cs</code></td>
+<td>Workpiece dimensions</td>
+</tr>
+<tr>
+<td><code>HeadOpBlock</code></td>
+<td><code>LSTParser/Job.cs</code></td>
+<td>Ordered list of <code>HeadOp</code>s for one NC program</td>
+</tr>
+<tr>
+<td><code>HeadOpUnit</code></td>
+<td><code>LSTParser/Job.cs</code></td>
+<td>Single line or arc segment</td>
+</tr>
+<tr>
+<td><code>PunchOp</code></td>
+<td><code>LSTParser/Job.cs</code></td>
+<td>Punch hit (extends <code>HeadOpUnit</code>)</td>
+</tr>
+<tr>
+<td><code>HeadOpBlockRef</code></td>
+<td><code>LSTParser/Job.cs</code></td>
+<td>Subroutine call-site with position and transform</td>
+</tr>
+<tr>
+<td><code>OpTreeBuilder</code></td>
+<td><code>LSTParser/Job2.cs</code></td>
+<td>Assembles <code>HeadOpBlock</code> tree from interpreter calls</td>
+</tr>
+<tr>
+<td><code>LSTPart</code></td>
+<td><code>CAMLib/LSTPart.cs</code></td>
+<td>Geometry (<code>Pline</code> list) for one part shape</td>
+</tr>
+<tr>
+<td><code>NCCodeFile / DINFile</code></td>
+<td><code>CAMLib/NCCodeFile.cs / DINFile.cs</code></td>
+<td>Final result returned to the application</td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

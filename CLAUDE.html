@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CLAUDE</title>
+  <style>
+    body {
+      max-width: 980px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      font-family: Segoe UI, Arial, sans-serif;
+      line-height: 1.55;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 0.75rem;
+      overflow-x: auto;
+    }
+    code {
+      background: #f4f4f4;
+      padding: 0.1rem 0.25rem;
+      border-radius: 3px;
+    }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; }
+  </style>
+</head>
+<body>
+<h1>CLAUDE.md</h1>
+<p>This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.</p>
+<h2>What This Is</h2>
+<p>Vulcan is a WPF/WinForms desktop application (.NET 10.0, x64) for laser machine control and CAM operations, built by TRUMPF Metamation. It parses and executes DIN/LST NC code files, drives Eckelmann and NCRX laser controllers, and provides a layout editor, job scheduler, and laser technology database.</p>
+<h2>Build</h2>
+<p>The primary solution is <code>Src/Vulcan.sln</code>. All projects output to the shared <code>bin/</code> folder at the repo root.</p>
+<pre><code>dotnet build Src/Vulcan.sln
+</code></pre>
+<p>The Flux framework (a separate shared infrastructure library) must be available at <code>X:\Src\</code> — this is a mapped network/virtual drive to a sibling repo. CAMLib has a pre-build event that copies <code>Ijwhost.dll</code> and <code>armarium.ver</code> from <code>X:\src\bin\</code> into <code>bin\</code>.</p>
+<p>Resource packaging (images, language files) is done separately via <code>makewad.bat</code>, which assembles <code>Res/</code> directories from source paths <code>L:\Src\Res</code>, <code>L:\CUILib\Res</code>, and <code>L:\CAMLib\Res</code> into <code>bin\Vulcan.wad</code>.</p>
+<p><code>EnterpriseVulcan.dll</code> is embedded as a compressed resource inside the main executable (<code>Vulcan.Resource.EV</code>) and loaded at runtime via a custom <code>AssemblyResolve</code> handler in <code>App.xaml.cs</code>.</p>
+<h2>Tests</h2>
+<p>Tests use a <strong>custom framework</strong> (<code>Tools/TestLib/Testing.cs</code>) — not NUnit or xUnit. The runner is <code>Tools/CTester/CTester.exe</code>.</p>
+<pre><code># Run all tests (from the bin/ directory)
+CTester.exe -run
+
+# Run specific test assemblies
+CTester.exe -run VulcanTest.dll
+
+# Regenerate expected output files instead of comparing
+CTester.exe -regenerate VulcanTest.dll
+
+# Run only fixtures marked with a given tag
+CTester.exe -run -tag TAGNAME
+</code></pre>
+<p>CTester reads diff tool path from <code>c:\mm\mm.ini</code> under <code>[Paths] DIFF=</code>.</p>
+<p>Test classes use <code>[TestFixture("name")]</code>; test methods use <code>[Test("description")]</code>. To run a single test in isolation, set <code>[Test(OnlyThis = true)]</code> on the method — this makes the runner skip all others. Skipped tests use <code>[Test(Skip = true)]</code>. Assertions include <code>Assert.AreEqual</code>, <code>Assert.AreTextFilesEqual</code>, and <code>Assert.AreImageFilesEqual</code> (PNG diff).</p>
+<h2>Architecture</h2>
+<h3>Dependency layers (bottom to top)</h3>
+<pre><code>Flux.*          — external framework at X:\Src\ (GUI, API, IniFile, Sys utilities)
+LSTParser       — parses LST job files (layout+NC programs)
+CAMLib          — core domain: NC parsing, machine control, comms, drawing
+CUILib          — custom WPF/WinForms control library built on CAMLib
+Vulcan          — main application UI
+EnterpriseVulcan — enterprise feature add-in (embedded in Vulcan.exe at build time)
+LaserTableConfigurator — standalone tool for editing the laser method database
+</code></pre>
+<p><code>VulcanTest</code> references both <code>CAMLib</code> and <code>Vulcan</code> (for integration tests).</p>
+<h3>CAMLib</h3>
+<p>The heart of the system. Key types:</p>
+<ul>
+<li><code>NCCodeFile</code> (abstract) — factory via <code>LoadNCCodeFile(path)</code>. Converts LST→DIN on load. Subclassed by <code>DINFile</code>.</li>
+<li><code>DINFile</code> — parses DIN-format NC programs block by block.</li>
+<li><code>NCDrawing</code> / <code>NCContour</code> — geometry and drawing primitives for visualizing NC paths.</li>
+<li><code>Controls.cs</code> — machine control state machine.</li>
+<li><code>Machine.cs</code> / <code>MachineDef</code> — axis definitions and machine instance abstraction.</li>
+<li><code>Comm/Eckelmann.cs</code>, <code>Comm/NCRXComm.cs</code> — controller communication drivers.</li>
+<li><code>ProductionPlan.cs</code> — job scheduling and production sequencing.</li>
+</ul>
+<h3>CUILib</h3>
+<p>Custom UI framework on top of CAMLib. The <code>Praxis/</code> sub-namespace (<code>PX.cs</code>, <code>Interface.cs</code>) integrates with the external Praxis MES/repository system for program checkout/check-in. <code>UILib.cs</code> provides shared utilities, theme constants, and file info persistence.</p>
+<h3>Vulcan (main app)</h3>
+<p>Page-based navigation without a navigation controller — pages are instantiated and shown directly. Key pages:</p>
+<ul>
+<li><code>HomePage.cs</code> — main dashboard, entry point</li>
+<li><code>EditPage.cs</code> / <code>EditLST.cs</code> — NC/LST program editing</li>
+<li><code>LayoutEditpage.cs</code> — nesting and layout editor</li>
+<li><code>RunPage.cs</code> — active machine operation</li>
+<li><code>SimulatePage.cs</code> — dry-run simulation</li>
+<li><code>PopupWindow.cs</code> — large modal dialog hub (268 KB)</li>
+</ul>
+<p><code>MachineSettings/</code> contains ~13 files covering axis, PLC, technology, and display settings. <code>DINTextEditor/</code> contains a custom syntax lexer and editor panel for DIN code. <code>PostProduction/</code> handles LST nesting, camera integration, and post-processing.</p>
+<h2>Naming Conventions</h2>
+<ul>
+<li>Private instance fields: <code>mFieldName</code> (prefix <code>m</code>)</li>
+<li>Static fields: <code>sFieldName</code> (prefix <code>s</code>)</li>
+<li>Enums: <code>EEnumName</code> (prefix <code>E</code>), e.g. <code>EAxis</code>, <code>ESplMachineFeatures</code>, <code>EZRetract</code></li>
+<li>New files must be manually added to the <code>.csproj</code> — <code>EnableDefaultCompileItems</code> is false in all projects.</li>
+</ul>
+</body>
+</html>

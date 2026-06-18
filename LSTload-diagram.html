@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LSTload-diagram</title>
+  <style>
+    body {
+      max-width: 980px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      font-family: Segoe UI, Arial, sans-serif;
+      line-height: 1.55;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 0.75rem;
+      overflow-x: auto;
+    }
+    code {
+      background: #f4f4f4;
+      padding: 0.1rem 0.25rem;
+      border-radius: 3px;
+    }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; }
+  </style>
+</head>
+<body>
+<h1>LST Loading — Diagrams</h1>
+<p>Three diagrams: the overall pipeline, the NC interpreter inner loop, and the resulting object graph.</p>
+<hr />
+<h2>1 · Pipeline</h2>
+<pre><code class="language-mermaid">flowchart TD
+    ENTRY([&quot;LoadNCCodeFile(filename.lst)\nCAMLib/NCCodeFile.cs&quot;])
+
+    subgraph PLST[&quot;ProcessLST()&quot;]
+        direction TB
+
+        subgraph S1[&quot;Stage 1 — Structural parse   NcConfig.Create()&quot;]
+            direction LR
+            LSTITR[&quot;LstItr\nhandles * / - line\ncontinuations&quot;]
+            TABLES[&quot;BEGIN_…ENDE_ blocks\n→ LstTable list\nEINRICHTEPLAN_INFO\nSHEET_TECH · LTT_CALLS\nFERTIGUNG_AUFTRAG_TMP …&quot;]
+            LISTINGS[&quot;START_TEXT…STOP_TEXT\n→ mNcListings dict\nkey = program name\nvalue = List&amp;lt;string&amp;gt; lines&quot;]
+            LSTITR --&gt; TABLES
+            LSTITR --&gt; LISTINGS
+        end
+
+        subgraph S2[&quot;Stage 2 — NC interpretation   NcConfig.InitOpTree()&quot;]
+            direction TB
+            CTX[&quot;NcProgramContext.Execute()\nmain program&quot;]
+            XFM[&quot;NcCoordXfm\nTRANS · ATRANS\nROT · AROT&quot;]
+            SUB[&quot;NcContext.BuildSubprogram()\n↺ NcProgramContext.Execute()\nfor each called subroutine\nmax depth 8 · memoised&quot;]
+            OBB[&quot;IOpBlockBuilder\nAddLineTo  AddArcTo\nAddPunchLineTo  AddPunchArcTo\nAddOpBlockRef  Completed()&quot;]
+            CTX -- &quot;frame commands&quot; --&gt; XFM
+            XFM -- &quot;transforms coords&quot; --&gt; OBB
+            CTX -- &quot;subroutine name literal&quot; --&gt; SUB
+            SUB -- &quot;HeadOpBlock per sub&quot; --&gt; OBB
+            CTX -- &quot;motion lines&quot; --&gt; OBB
+        end
+
+        subgraph S3[&quot;Stage 3 — Assembly   JobUtil2.CreateJob()&quot;]
+            direction LR
+            OTREE[&quot;OpTreeBuilder\nReconstructedMainBlock\n(HeadOpBlock tree)&quot;]
+            SHEET[&quot;Sheet(sheetX, sheetY, sheetZ)\nfrom SHEET_TECH cols 20 30 40&quot;]
+            PUNCHES[&quot;Punch palette\nStdPunch / CustomPunch\nfrom PROGRAMM + WZG_STAMM&quot;]
+            JOB[&quot;Job\n└─ Workitem\n   ├─ Workpiece (Sheet)\n   └─ HeadOpBlock&quot;]
+            OTREE --&gt; JOB
+            SHEET --&gt; JOB
+            PUNCHES --&gt; JOB
+        end
+
+        subgraph S4[&quot;Stage 4 — Part geometry   LoadParts()&quot;]
+            direction LR
+            WALK[&quot;Walk HeadOpBlockRef nodes\nin HeadOpBlock.HeadOps&quot;]
+            CSP[&quot;ConsumeSubPgm()\nHeadOpUnit → Pline.Add(pt)\narc → Pline.Add(pt, center, ccw)\nmove → flush Pline, start new&quot;]
+            PARTS[&quot;LSTPart[]\nname + List&amp;lt;Pline&amp;gt; + SubPgms&quot;]
+            WALK --&gt; CSP --&gt; PARTS
+        end
+
+        subgraph S5[&quot;Stage 5 — DIN generation   ProcessPgm()&quot;]
+            direction TB
+            HDR[&quot;DIN header\n%1(name) · MACHINE · USER\nMachiningTime · Sheet_Size_X/Y\nG90/G91 · M15 · G17 · CheckBoundPrg&quot;]
+            MAP[&quot;LST → DIN command mapping\nTC_LASER_ON → M1014 + TC_UPDATE_PARAM\nTC_LASER_OFF → M1015\nG823 → comment  G824 → M1030/31\nROT → G89 C=  · sub call → G22 Jn&quot;]
+            DIN[&quot;Write  {ProgramsPath}/DINs/name.din&quot;]
+            HDR --&gt; DIN
+            MAP --&gt; DIN
+        end
+    end
+
+    subgraph DINPARSE[&quot;DINFile — CAMLib/DINFile.cs&quot;]
+        DF[&quot;new DINFile(dinPath)\nparse DIN syntax\nbuild Contours[]  Drawing\nLines[]  SheetSize  Name&quot;]
+    end
+
+    RESULT([&quot;NCCodeFile returned to caller&quot;])
+
+    ENTRY --&gt; LSTITR
+    LISTINGS --&gt; CTX
+    S1 --&gt; S2
+    S2 --&gt; S3
+    S3 --&gt; S4
+    S3 --&gt; S5
+    S5 --&gt; DF
+    DF --&gt; RESULT
+</code></pre>
+<hr />
+<h2>2 · NcProgramContext.Execute() — per-line interpreter</h2>
+<pre><code class="language-mermaid">flowchart TD
+    START([&quot;Execute() — begin&quot;])
+    INIT[&quot;Init state\nheadX/Y = 0,0\nisLaserOn = false\nxfm = NcCoordXfm.Identity\nmUseAbsoluteDimension = inherited\n\nMain program only:\nxfm = xfm.Translated(-zeroX, -zeroY)&quot;]
+    NEXTLINE{&quot;next line\nfrom TextLineItr&quot;}
+    DONE([&quot;Completed(totalLines)\n→ HeadOpBlock added to OpTreeBuilder&quot;])
+
+    PARSE[&quot;NcItem.Parse(line)\n→ token stream&quot;]
+
+    NCWORD[&quot;NcWord token\nX Y I J G A B Z F M&quot;]
+    COMMENT[&quot;Comment token\n;ENTRY_LASER:\n;ENTRY_PUNCH:&quot;]
+    LITERAL[&quot;Literal token&quot;]
+    SUBCALL[&quot;SubCall token\nTC_LASER_ON/OFF\nTC_TOOL_LOAD\nTC_SHEET_REPOSIT&quot;]
+    ROT[&quot;NcROT / NcAROT token\nROT RPL=  /  AROT RPL=&quot;]
+
+    EXTRACT[&quot;Extract into registers\nncX  ncY  ncI  ncJ  ncG\nscale by mUnitScale\nset mBits flags\nG70→scale=25.4  G71→scale=1\nG90/G91 → abs/inc mode&quot;]
+
+    PARTBEGINS[&quot;partBegins = true\nSetPartEntryLine(lineNum)&quot;]
+
+    TRANS[&quot;TRANS / ATRANS\nxfm = xfm.Translated(x,y,additive)&quot;]
+    ISSUBPGM{&quot;IsSubProgramName\n(literal)?&quot;}
+    UNKNOWN[&quot;skip line&quot;]
+    ROTXFM[&quot;xfm = xfm.Rotated(angle, additive)&quot;]
+
+    LASER[&quot;isLaserOn = true/false\nSetHeadActiveLine / SetHeadInactiveLine&quot;]
+    TOOL[&quot;PunchId = parameter&quot;]
+    REPOS[&quot;xfm = xfm.Translated(-repoX,-repoY, additive)&quot;]
+
+    TRANSFORM{&quot;has X or Y?&quot;}
+
+    ABSMODE[&quot;Absolute:\nx,y = ncX,ncY\nxfm.TransformPointXY(ref x, ref y)\nheadX = x  headY = y&quot;]
+    INCMODE[&quot;Incremental:\ndx = ncX  dy = ncY\nxfm.TransformVectorXY(ref dx, ref dy)\nheadX += dx  headY += dy&quot;]
+
+    MOTION{&quot;G02/G03\nwith I or J?&quot;}
+
+    ARCIJ[&quot;Arc center:\nradX = ncI  radY = ncJ\nxfm.TransformVectorXY()\ncenterX = lastX + radX\ncenterY = lastY + radY\n\nfull circle if no X/Y or\ndisplacement == 0&quot;]
+
+    PUNCHACTIVE{&quot;punch/nibble\nactive?&quot;}
+
+    ADDARC[&quot;AddArcTo(\nlineNum, toX, toY,\ncenterX, centerY, bits)&quot;]
+    ADDPUNCHARC[&quot;AddPunchArcTo(\nlineNum, toX, toY,\ncenterX, centerY,\npunchId, …, bits)&quot;]
+    ADDLINE[&quot;AddLineTo(\nlineNum, toX, toY, bits)&quot;]
+    ADDPUNCHLINE[&quot;AddPunchLineTo(\nlineNum, toX, toY,\npunchId, …, bits)&quot;]
+
+    BUILDSUB[&quot;NcContext.BuildSubprogram(this, name)\n→ new NcProgramContext\n→ Execute() ↺\n→ returns dispX, dispY, xfmDelta\nAddOpBlockRef(lineNum, name, headX, headY, …)&quot;]
+
+    START --&gt; INIT --&gt; NEXTLINE
+    NEXTLINE --&gt;|&quot;line&quot;| PARSE
+    NEXTLINE --&gt;|&quot;EOF&quot;| DONE
+
+    PARSE --&gt; NCWORD &amp; COMMENT &amp; LITERAL &amp; SUBCALL &amp; ROT
+
+    NCWORD --&gt; EXTRACT --&gt; TRANSFORM
+    COMMENT --&gt; PARTBEGINS --&gt; NEXTLINE
+    LITERAL --&gt;|&quot;TRANS/ATRANS&quot;| TRANS --&gt; NEXTLINE
+    LITERAL --&gt; ISSUBPGM
+    ISSUBPGM --&gt;|yes| BUILDSUB --&gt; NEXTLINE
+    ISSUBPGM --&gt;|no| UNKNOWN --&gt; NEXTLINE
+    ROT --&gt; ROTXFM --&gt; NEXTLINE
+    SUBCALL --&gt;|&quot;TC_LASER_ON/OFF&quot;| LASER --&gt; NEXTLINE
+    SUBCALL --&gt;|&quot;TC_TOOL_LOAD&quot;| TOOL --&gt; NEXTLINE
+    SUBCALL --&gt;|&quot;TC_SHEET_REPOSIT&quot;| REPOS --&gt; NEXTLINE
+
+    TRANSFORM --&gt;|&quot;no X/Y&quot;| NEXTLINE
+    TRANSFORM --&gt;|yes, absolute| ABSMODE --&gt; MOTION
+    TRANSFORM --&gt;|yes, incremental| INCMODE --&gt; MOTION
+
+    MOTION --&gt;|yes| ARCIJ --&gt; PUNCHACTIVE
+    MOTION --&gt;|no| PUNCHACTIVE
+
+    PUNCHACTIVE --&gt;|no, arc| ADDARC --&gt; NEXTLINE
+    PUNCHACTIVE --&gt;|yes, arc| ADDPUNCHARC --&gt; NEXTLINE
+    PUNCHACTIVE --&gt;|no, line| ADDLINE --&gt; NEXTLINE
+    PUNCHACTIVE --&gt;|yes, line| ADDPUNCHLINE --&gt; NEXTLINE
+</code></pre>
+<hr />
+<h2>3 · Result object graph</h2>
+<pre><code class="language-mermaid">classDiagram
+    direction TB
+
+    class NCCodeFile {
+        &lt;&lt;abstract&gt;&gt;
+        +string Name
+        +string FilePath
+        +Size SheetSize
+        +LoadNCCodeFile(filename)$ NCCodeFile
+        +CheckForRemnant()
+    }
+
+    class DINFile {
+        +NCContour[] Contours
+        +NCDrawing Drawing
+        +string[] Lines
+        +bool ContainsNJ
+    }
+
+    class Job {
+        +Workitem Workitem
+        -double mZeroOffsetX
+        -List~IPunch~ mPunches
+        +SetZeroOffset(x)
+        +AddPunch(punch)
+        +ComputeAbsLineNumber(callstack)
+        +GetOpPath(callstack)
+    }
+
+    class Workitem {
+        +Workpiece Workpiece
+        +HeadOpBlock HeadOpBlock
+    }
+
+    class Workpiece {
+        &lt;&lt;abstract&gt;&gt;
+        +double Width
+        +double Height
+        +double Thickness
+        +Types Type
+    }
+
+    class Sheet {
+        +Types.Sheet
+    }
+
+    class Tube {
+        +Types.Tube
+    }
+
+    class HeadOpBlock {
+        +string Name
+        +string NameLower
+        +List~HeadOp~ HeadOps
+        +int TotalLines
+        +List~int~ PartEntryLines
+        +List~int~ HeadOnLines
+        +List~int~ HeadOffLines
+        +int ColorZLength
+        +int LinesDeepcount
+    }
+
+    class HeadOp {
+        &lt;&lt;abstract&gt;&gt;
+        +int LineNumber
+        +int AbsLineNumber
+        +int ColorZIndex
+        +bool IsUnitOp
+    }
+
+    class HeadOpUnit {
+        +Point ToPt
+        +Point ArcCenter
+        +bool IsMoveOp
+        +bool IsArc
+        +bool IsCcw
+        +bool IsCircle
+        +bool IsBeamOff
+        +bool IsEntryLaserHinted
+        +bool IsLaserOn
+        +CreateLinearToOp(...)$
+        +CreateArcToOp(...)$
+    }
+
+    class PunchOp {
+        +string PunchId
+        +float PunchAngle
+        +int PunchCount
+        +CreateLineHitOp(...)$
+        +CreateArcHitOp(...)$
+    }
+
+    class HeadOpBlockRef {
+        +HeadOpBlock Block
+        +Point Pos
+        +double Rotation
+        +NcCoordXfm Xfm
+        +List~string~ Labels
+        +bool BeginsPart
+    }
+
+    class NcCoordXfm {
+        -double mOriginX
+        -double mOriginY
+        -double mRotation
+        -double mSin
+        -double mCos
+        +double FrameRotation
+        +bool HasTranslation
+        +bool IsIdentity
+        +Identity$ NcCoordXfm
+        +TransformPointXY(ref x, ref y)
+        +TransformVectorXY(ref x, ref y)
+        +Translated(dx, dy, additive) NcCoordXfm
+        +Rotated(angle, additive) NcCoordXfm
+        +Appended(other) NcCoordXfm
+        +Inverted() NcCoordXfm
+    }
+
+    class LstTable {
+        +string Name
+        +int StartLineNumber
+        -List~ColumnInfo~ mColumns
+        -List~string[]~ mRowCells
+        +GetS(row, colId) string
+        +GetF(row, colId) double
+        +GetMM(row, colId) double
+        +Rows IEnumerable
+    }
+
+    class NcConfig {
+        +string MainProgramName
+        +double SheetX
+        +double SheetY
+        +double SheetZ
+        +double ZeroPointX
+        +double ZeroPointY
+        +bool UsesInch
+        +bool IsMainPrgAbsolute
+        +bool MeasureSheetPosition
+        +Create(lstContent)$ NcConfig
+        +InitOpTree(builder, logger)
+        +GetTables() List~LstTable~
+        +GetNcPrgListings()
+        +GetPunchIds()
+    }
+
+    class LSTPart {
+        +string Name
+        +List~Pline~ mPlines
+        +List~string~ SubPgms
+        +Add(pline)
+    }
+
+    class Pline {
+        +Point2 P1
+        +Point2 P2
+        +List~Seg2~ Segs
+        +bool IsClosed
+        +bool IsCircle
+        +int Count
+        +Add(pt)
+        +Add(pt, center, ccw)
+    }
+
+    NCCodeFile &lt;|-- DINFile
+    Job &quot;1&quot; *-- &quot;1&quot; Workitem
+    Workitem &quot;1&quot; *-- &quot;1&quot; Workpiece
+    Workpiece &lt;|-- Sheet
+    Workpiece &lt;|-- Tube
+    Workitem &quot;1&quot; *-- &quot;1&quot; HeadOpBlock
+    HeadOpBlock &quot;1&quot; *-- &quot;0..*&quot; HeadOp
+    HeadOp &lt;|-- HeadOpUnit
+    HeadOpUnit &lt;|-- PunchOp
+    HeadOp &lt;|-- HeadOpBlockRef
+    HeadOpBlockRef &quot;1&quot; --&gt; &quot;1&quot; HeadOpBlock : references
+    HeadOpBlockRef &quot;1&quot; *-- &quot;1&quot; NcCoordXfm
+    NcConfig &quot;1&quot; *-- &quot;0..*&quot; LstTable
+    LSTPart &quot;1&quot; *-- &quot;0..*&quot; Pline
+    Job ..&gt; NcConfig : created from
+    Job ..&gt; LSTPart : LoadParts produces
+    DINFile ..&gt; Job : ProcessLST consumes
+</code></pre>
+<hr />
+<h2>4 · Data flow summary</h2>
+<pre><code class="language-mermaid">flowchart LR
+    LST([&quot;filename.lst\nraw text&quot;])
+
+    subgraph LSTPARSER[&quot;LSTParser.dll&quot;]
+        NC[&quot;NcConfig\ntables + listings&quot;]
+        TREE[&quot;HeadOpBlock tree\nHeadOpUnit · PunchOp\nHeadOpBlockRef&quot;]
+        JOB[&quot;Job\nWorkitem · Sheet\nPunch palette&quot;]
+    end
+
+    subgraph CAMLIB[&quot;CAMLib.dll&quot;]
+        PARTS[&quot;LSTPart[]\nPline geometry&quot;]
+        DIN[&quot;name.din\non disk&quot;]
+        DINFILE[&quot;DINFile\nNCCodeFile&quot;]
+    end
+
+    LST --&gt;|&quot;NcConfig.Create()&quot;| NC
+    NC --&gt;|&quot;InitOpTree()\nNcProgramContext.Execute()&quot;| TREE
+    TREE --&gt;|&quot;JobUtil2.CreateJob()&quot;| JOB
+    JOB --&gt;|&quot;LoadParts()&quot;| PARTS
+    JOB --&gt;|&quot;ProcessPgm()\nLST→DIN mapping&quot;| DIN
+    DIN --&gt;|&quot;new DINFile()&quot;| DINFILE
+</code></pre>
+</body>
+</html>
